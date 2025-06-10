@@ -1,0 +1,34 @@
+[project]
+name = "clustera-kernel-template"
+version = "0.1.0"
+description = "A template for creating Clustera kernels - Python Kafka consumers that provide functionality to the Clustera platform"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "kafka-python",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+# Common optional dependencies for different kernel types
+database = [
+    "psycopg2-binary",      # PostgreSQL
+    "sqlalchemy",           # ORM
+]
+http = [
+    "httpx",                # Async HTTP client
+    "fastapi",              # Web framework
+    "uvicorn",              # ASGI server
+]
+ai = [
+    "openai",               # OpenAI API
+    "anthropic",            # Anthropic API
+    "transformers",         # Hugging Face transformers
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
