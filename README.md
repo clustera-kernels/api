@@ -1,51 +1,63 @@
-# Clustera Kernel Template
+# Clustera API Kernel
 
-A template for creating new Clustera kernels - Python Kafka consumers that provide specific functionality to the Clustera platform.
+A Clustera kernel that provides a REST API endpoint for submitting natural language queries to the Clustera platform via Kafka.
 
-## What is a Clustera Kernel?
+## What is the API Kernel?
 
-A Clustera kernel is a module of functionality that:
-- Consumes messages from Kafka topics
-- Processes messages according to specific business logic
-- Integrates with databases, APIs, or other services
-- Provides capabilities like memory, analytics, notifications, etc.
+The API kernel is a specialized Clustera module that:
+- Exposes a REST API with a `POST /query` endpoint
+- Receives natural language prompts via HTTP requests
+- Publishes queries to a configurable Kafka topic
+- Returns confirmation once messages are successfully published
+- Provides an HTTP interface to the Clustera platform
 
-This template provides a robust foundation with:
-- SSL-enabled Kafka consumer setup
-- Proper error handling and logging
-- Partition management and rebalancing
-- Manual offset commits for reliability
-- Configurable processing logic
+This kernel serves as the entry point for external applications to submit queries to Clustera for processing by other kernels.
+
+## API Specification
+
+### POST /query
+
+Submit a natural language query to the Clustera platform.
+
+**Request:**
+```json
+{
+  "prompt": "What is the weather like today?",
+  "metadata": {
+    "user_id": "user123",
+    "source": "web_app"
+  }
+}
+```
+
+**Response (201 Created):**
+```json
+{
+  "status": "published",
+  "query_id": "uuid-generated-id",
+  "topic": "clustera-queries",
+  "timestamp": "2024-01-01T12:00:00Z"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request`: Invalid request format or missing prompt
+- `500 Internal Server Error`: Kafka publishing failure
+- `503 Service Unavailable`: Kafka connection issues
 
 ## Quick Start
 
-### 1. Clone and Customize
+### 1. Environment Setup
 
 ```bash
-# Clone this template
-git clone <your-template-repo> my-new-kernel
-cd my-new-kernel
-
-# Update the kernel configuration in main.py
-# Change KERNEL_NAME and DEFAULT_TOPIC at the top of main.py
-```
-
-### 2. Environment Setup
-
-```bash
-# Copy the environment template
-cp .env.template .env
-
 # Install dependencies
 uv sync
 
-# Optional: Install additional dependencies for your kernel type
-uv add --optional database  # For database kernels
-uv add --optional http      # For HTTP/API kernels  
-uv add --optional ai        # For AI/ML kernels
+# Install HTTP dependencies for the API kernel
+uv add --optional http
 ```
 
-### 3. Configure Environment Variables
+### 2. Configure Environment Variables
 
 Edit `.env` and set:
 
@@ -56,38 +68,19 @@ KAFKA_CA_CERT=base64-encoded-ca-certificate
 KAFKA_CLIENT_CERT=base64-encoded-client-certificate
 KAFKA_CLIENT_KEY=base64-encoded-client-private-key
 
-# Kernel Configuration (optional)
-KAFKA_TOPIC=your-topic-name                    # Defaults to clustera-hello-world
-KAFKA_CLIENT_ID=your-client-id                 # Defaults to {kernel-name}-consumer-{pid}
-KAFKA_CONSUMER_GROUP=your-consumer-group       # Defaults to {kernel-name}-group
+# API Kernel Configuration
+KAFKA_TOPIC_QUERIES=clustera-queries          # Topic to publish queries to
+API_HOST=0.0.0.0                              # API server host
+API_PORT=8000                                 # API server port
+API_LOG_LEVEL=info                            # Logging level
 
-# Add your kernel-specific environment variables here
-DATABASE_URL=postgresql://...                  # If using database
-API_KEY=your-api-key                          # If using external APIs
+# Optional: Authentication and security
+API_AUTH_ENABLED=false                        # Enable API authentication
+API_AUTH_TOKEN=your-secret-token              # Required if auth enabled
+CORS_ORIGINS=*                                # CORS allowed origins
 ```
 
-### 4. Implement Your Logic
-
-The main function you'll customize is `process_message()` in `main.py`:
-
-```python
-def process_message(message):
-    """
-    Process a single Kafka message.
-    
-    Replace the hello-world logic with your kernel's specific functionality.
-    """
-    # Your kernel logic here
-    # Examples:
-    # - Parse message and store in database
-    # - Call external APIs
-    # - Transform and forward to another topic
-    # - Update in-memory state
-    
-    return True  # Return False if processing failed
-```
-
-### 5. Run Your Kernel
+### 3. Run the API Kernel
 
 ```bash
 # Run locally
@@ -97,72 +90,72 @@ python main.py
 uv run python main.py
 
 # Run with Docker
-docker build -t my-kernel .
-docker run --env-file .env my-kernel
+docker build -t clustera-api-kernel .
+docker run -p 8000:8000 --env-file .env clustera-api-kernel
 ```
 
-## Customization Guide
+The API will be available at `http://localhost:8000`
 
-### Kernel Configuration
-
-Update these constants in `main.py`:
-
-```python
-KERNEL_NAME = "your-kernel-name"        # Used in logging and defaults
-DEFAULT_TOPIC = "your-default-topic"    # Default Kafka topic to consume
-```
-
-### Processing Logic
-
-The `process_message(message)` function receives Kafka messages with these attributes:
-- `message.key` - Message key (bytes or None)
-- `message.value` - Message value (bytes or None) 
-- `message.offset` - Message offset in partition
-- `message.partition` - Partition number
-- `message.timestamp` - Message timestamp
-- `message.headers` - Message headers (list of tuples)
-
-### Error Handling
-
-Customize error handling in the main loop:
-- Return `False` from `process_message()` for retriable errors
-- Raise exceptions for fatal errors
-- Implement retry logic, dead letter queues, or circuit breakers as needed
-
-### Dependencies
-
-Add kernel-specific dependencies:
+### 4. Test the API
 
 ```bash
-# Database kernels
-uv add --optional database
+# Submit a query
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What is the current time?"}'
 
-# HTTP/API kernels  
-uv add --optional http
-
-# AI/ML kernels
-uv add --optional ai
-
-# Or add specific packages
-uv add requests numpy pandas
+# With metadata
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Analyze this data",
+    "metadata": {
+      "user_id": "user123",
+      "priority": "high"
+    }
+  }'
 ```
+
+## Configuration
 
 ### Environment Variables
 
-Add kernel-specific environment variables and update the `.env.template`:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KAFKA_BOOTSTRAP_SERVERS` | - | Kafka broker connection string (required) |
+| `KAFKA_CA_CERT` | - | Base64-encoded CA certificate (required) |
+| `KAFKA_CLIENT_CERT` | - | Base64-encoded client certificate (required) |
+| `KAFKA_CLIENT_KEY` | - | Base64-encoded client private key (required) |
+| `KAFKA_TOPIC_QUERIES` | `clustera-queries` | Topic to publish queries to |
+| `API_HOST` | `0.0.0.0` | API server host |
+| `API_PORT` | `8000` | API server port |
+| `API_LOG_LEVEL` | `info` | Logging level (debug, info, warning, error) |
+| `API_AUTH_ENABLED` | `false` | Enable API authentication |
+| `API_AUTH_TOKEN` | - | Authentication token (if auth enabled) |
+| `CORS_ORIGINS` | `*` | CORS allowed origins |
 
-```python
-# In your code
-database_url = os.getenv("DATABASE_URL")
-api_key = os.getenv("API_KEY")
-model_name = os.getenv("MODEL_NAME", "default-model")
+### Kafka Message Format
+
+Published messages have this structure:
+
+```json
+{
+  "query_id": "uuid-generated-id",
+  "prompt": "User's natural language prompt",
+  "metadata": {
+    "user_id": "optional-user-id",
+    "source": "api_kernel",
+    "timestamp": "2024-01-01T12:00:00Z",
+    "custom_field": "custom_value"
+  }
+}
 ```
 
 ## Project Structure
 
 ```
-your-kernel/
-├── main.py              # Main kernel application
+api-kernel/
+├── main.py              # FastAPI application and Kafka producer
 ├── pyproject.toml       # Python project configuration
 ├── Dockerfile           # Container configuration
 ├── README.md            # This file
@@ -178,92 +171,155 @@ your-kernel/
 
 1. Connect your repository to Railway
 2. Set environment variables in Railway dashboard
-3. Deploy automatically on git push
+3. Railway will automatically expose the service on HTTPS
+4. Use the provided URL to access your API
 
 ### Docker
 
 ```bash
 # Build image
-docker build -t your-kernel .
+docker build -t clustera-api-kernel .
 
-# Run container
-docker run --env-file .env your-kernel
+# Run container with port mapping
+docker run -p 8000:8000 --env-file .env clustera-api-kernel
 ```
 
 ### Local Development
 
 ```bash
-# Install in development mode
-uv sync --dev
+# Install with HTTP dependencies
+uv sync
+uv add --optional http
 
-# Run with auto-reload (if you add file watching)
-uv run python main.py
+# Run with auto-reload
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## Example Kernels
+## API Usage Examples
 
-### Memory Kernel
+### Basic Query Submission
+
 ```python
-def process_message(message):
-    """Store messages as memories in PostgreSQL"""
-    memory_data = json.loads(message.value.decode('utf-8'))
-    store_memory(memory_data)
-    return True
+import httpx
+
+# Submit a simple query
+response = httpx.post(
+    "http://localhost:8000/query",
+    json={"prompt": "What is machine learning?"}
+)
+
+if response.status_code == 201:
+    result = response.json()
+    print(f"Query {result['query_id']} published successfully")
 ```
 
-### Analytics Kernel
+### Query with Metadata
+
 ```python
-def process_message(message):
-    """Process analytics events"""
-    event = json.loads(message.value.decode('utf-8'))
-    update_metrics(event)
-    send_to_warehouse(event)
-    return True
+import httpx
+
+# Submit a query with metadata
+response = httpx.post(
+    "http://localhost:8000/query",
+    json={
+        "prompt": "Generate a summary of our sales data",
+        "metadata": {
+            "user_id": "analyst_001",
+            "department": "sales",
+            "priority": "high",
+            "data_source": "salesforce"
+        }
+    }
+)
 ```
 
-### Notification Kernel
-```python
-def process_message(message):
-    """Send notifications based on events"""
-    notification = json.loads(message.value.decode('utf-8'))
-    if should_notify(notification):
-        send_notification(notification)
-    return True
+### JavaScript/Frontend Integration
+
+```javascript
+// Submit query from web application
+async function submitQuery(prompt, metadata = {}) {
+  try {
+    const response = await fetch('/query', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ prompt, metadata })
+    });
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log('Query submitted:', result.query_id);
+      return result;
+    } else {
+      throw new Error(`HTTP ${response.status}`);
+    }
+  } catch (error) {
+    console.error('Failed to submit query:', error);
+  }
+}
 ```
 
-## Best Practices
+## Health Checks and Monitoring
 
-1. **Idempotency**: Ensure message processing is idempotent
-2. **Error Handling**: Distinguish between retriable and fatal errors
-3. **Monitoring**: Add metrics and health checks
-4. **Testing**: Test with sample messages and error conditions
-5. **Documentation**: Update CLAUDE.md with kernel-specific guidance
-6. **Security**: Never commit secrets; use environment variables
+The API includes health check endpoints:
+
+- `GET /health` - Basic health check
+- `GET /health/kafka` - Kafka connectivity check
+- `GET /metrics` - Prometheus-compatible metrics (if enabled)
+
+## Security Considerations
+
+1. **Authentication**: Enable `API_AUTH_ENABLED` and set `API_AUTH_TOKEN` for production
+2. **CORS**: Configure `CORS_ORIGINS` appropriately for your frontend domains
+3. **Rate Limiting**: Consider implementing rate limiting for production use
+4. **Input Validation**: All prompts are validated and sanitized
+5. **SSL/TLS**: Use HTTPS in production (handled by Railway/reverse proxy)
 
 ## Troubleshooting
 
-### SSL Certificate Issues
-- Ensure certificates are base64-encoded
-- Check certificate expiration
-- Verify certificate permissions
+### Common Issues
 
-### Kafka Connection Issues
-- Verify bootstrap servers
-- Check network connectivity
-- Validate consumer group permissions
+**API not responding:**
+- Check if port 8000 is available
+- Verify `API_HOST` and `API_PORT` settings
+- Check firewall and network configuration
 
-### Processing Issues
-- Check message format expectations
-- Verify external service availability
-- Monitor consumer lag
+**Kafka publishing failures:**
+- Verify Kafka SSL certificates are correct
+- Check `KAFKA_BOOTSTRAP_SERVERS` connectivity
+- Ensure topic `KAFKA_TOPIC_QUERIES` exists
+- Verify Kafka permissions for your client
+
+**Authentication errors:**
+- Check `API_AUTH_TOKEN` if authentication is enabled
+- Verify token is included in request headers
+
+### Debug Mode
+
+Run with debug logging for troubleshooting:
+
+```bash
+API_LOG_LEVEL=debug uv run python main.py
+```
+
+## Integration with Other Kernels
+
+The API kernel works with other Clustera kernels:
+
+1. **Query Processing Kernel**: Consumes from `clustera-queries` topic
+2. **Memory Kernel**: Stores query history and context
+3. **Analytics Kernel**: Tracks query patterns and usage
+4. **Response Kernel**: Publishes responses back to users
 
 ## Contributing
 
-1. Fork this template
-2. Create your kernel
-3. Test thoroughly
-4. Document your changes
-5. Submit a pull request
+1. Fork this repository
+2. Create a feature branch
+3. Implement your changes
+4. Add tests for new functionality
+5. Update documentation
+6. Submit a pull request
 
 ## License
 

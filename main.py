@@ -5,216 +5,329 @@ import sys
 import logging
 import base64
 import tempfile
-from kafka import KafkaConsumer, ConsumerRebalanceListener
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 
-# Configuration - modify these for your specific kernel
-KERNEL_NAME = "hello-world"
-DEFAULT_TOPIC = "clustera-hello-world"
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field, validator
+from kafka import KafkaProducer
+import uvicorn
 
-def get_cert_data(env_var_name):
+# Configuration
+KERNEL_NAME = "api"
+DEFAULT_QUERIES_TOPIC = "clustera-queries"
+
+# Pydantic models for request/response
+class QueryMetadata(BaseModel):
+    """Optional metadata for the query"""
+    user_id: Optional[str] = None
+    source: Optional[str] = "api_kernel"
+    priority: Optional[str] = "normal"
+    
+    class Config:
+        extra = "allow"  # Allow additional fields
+
+class QueryRequest(BaseModel):
+    """Request model for POST /query"""
+    prompt: str = Field(..., min_length=1, max_length=10000, description="Natural language prompt")
+    metadata: Optional[QueryMetadata] = Field(default_factory=QueryMetadata)
+    
+    @validator('prompt')
+    def validate_prompt(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Prompt cannot be empty')
+        return v.strip()
+
+class QueryResponse(BaseModel):
+    """Response model for successful query submission"""
+    status: str = "published"
+    query_id: str
+    topic: str
+    timestamp: str
+
+class HealthResponse(BaseModel):
+    """Health check response"""
+    status: str
+    service: str = "clustera-api-kernel"
+    timestamp: str
+
+class KafkaHealthResponse(BaseModel):
+    """Kafka health check response"""
+    status: str
+    kafka_connected: bool
+    topic: str
+    timestamp: str
+
+# Global variables
+kafka_producer: Optional[KafkaProducer] = None
+security = HTTPBearer(auto_error=False)
+
+def get_cert_data(env_var_name: str) -> bytes:
     """Get and decode base64 certificate from environment variable"""
     cert_b64 = os.getenv(env_var_name)
     if not cert_b64:
         raise ValueError(f"Environment variable {env_var_name} not found")
     return base64.b64decode(cert_b64)
 
-def write_cert_to_temp_file(cert_data):
+def write_cert_to_temp_file(cert_data: bytes) -> str:
     """Write certificate data to a temporary file and return the path"""
     temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
     temp_file.write(cert_data)
     temp_file.close()
     return temp_file.name
 
-def process_message(message):
-    """
-    Process a single Kafka message.
-    
-    Override this function to implement your kernel's specific logic.
-    
-    Args:
-        message: Kafka message object with .key, .value, .offset, .partition, etc.
-    
-    Returns:
-        bool: True if message was processed successfully, False otherwise
-    """
+def setup_kafka_producer() -> KafkaProducer:
+    """Set up and configure the Kafka producer with SSL"""
     try:
-        # Extract message key
-        key_str = "No key"
-        if message.key is not None:
-            try:
-                key_str = message.key.decode('utf-8')
-            except UnicodeDecodeError:
-                key_str = f"[Binary key - {len(message.key)} bytes]"
+        # Get SSL certificate data from environment variables
+        ca_data = get_cert_data("KAFKA_CA_CERT")
+        cert_data = get_cert_data("KAFKA_CLIENT_CERT")
+        key_data = get_cert_data("KAFKA_CLIENT_KEY")
         
-        # Extract message value
-        value_str = "Null value"
-        if message.value is not None:
-            try:
-                value_str = message.value.decode('utf-8')
-            except UnicodeDecodeError:
-                value_str = f"[Binary data - {len(message.value)} bytes]"
+        # Write certificate data to temporary files
+        ca_file = write_cert_to_temp_file(ca_data)
+        cert_file = write_cert_to_temp_file(cert_data)
+        key_file = write_cert_to_temp_file(key_data)
         
-        # Hello-world processing: just log and print the message
-        print(f"[{KERNEL_NAME}] Message at offset {message.offset}")
-        print(f"  Key: {key_str}")
-        print(f"  Value: {value_str}")
-        print(f"  Partition: {message.partition}")
-        print(f"  Timestamp: {message.timestamp}")
-        print("---")
+        producer = KafkaProducer(
+            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", ""),
+            client_id=os.getenv("KAFKA_CLIENT_ID", f"{KERNEL_NAME}-producer-{os.getpid()}"),
+            security_protocol="SSL",
+            ssl_cafile=ca_file,
+            ssl_certfile=cert_file,
+            ssl_keyfile=key_file,
+            ssl_check_hostname=True,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            key_serializer=lambda k: k.encode('utf-8') if k else None,
+            acks='all',  # Wait for all replicas to acknowledge
+            retries=3,   # Retry on failure
+            batch_size=16384,
+            linger_ms=10,
+            buffer_memory=33554432,
+        )
         
-        # Force flush output for real-time visibility
-        sys.stdout.flush()
-        
-        # TODO: Implement your kernel's specific processing logic here
-        # Examples:
-        # - Store to database
-        # - Transform and forward to another topic
-        # - Trigger external API calls
-        # - Update in-memory state
-        
-        return True
+        logging.info(f"[{KERNEL_NAME}] Kafka producer initialized successfully")
+        return producer
         
     except Exception as e:
-        logging.error(f"Error processing message at offset {message.offset}: {e}")
-        return False
+        logging.error(f"[{KERNEL_NAME}] Failed to initialize Kafka producer: {e}")
+        raise
 
-class KernelPartitionListener(ConsumerRebalanceListener):
-    """Handle Kafka partition assignment and rebalancing events"""
+async def verify_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> bool:
+    """Verify API authentication if enabled"""
+    auth_enabled = os.getenv("API_AUTH_ENABLED", "false").lower() == "true"
     
-    def __init__(self, consumer):
-        self.consumer = consumer
+    if not auth_enabled:
+        return True
     
-    def on_partitions_assigned(self, assigned):
-        """Called when partitions are assigned to this consumer"""
-        partition_info = [f"{tp.topic}:{tp.partition}" for tp in assigned]
-        logging.info(f"[{KERNEL_NAME}] Partitions assigned: {', '.join(partition_info)}")
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    expected_token = os.getenv("API_AUTH_TOKEN")
+    if not expected_token:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication configuration error"
+        )
+    
+    if credentials.credentials != expected_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    return True
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan management"""
+    global kafka_producer
+    
+    # Startup
+    logging.info(f"[{KERNEL_NAME}] Starting API kernel...")
+    try:
+        kafka_producer = setup_kafka_producer()
+        logging.info(f"[{KERNEL_NAME}] API kernel startup complete")
+    except Exception as e:
+        logging.error(f"[{KERNEL_NAME}] Failed to start API kernel: {e}")
+        sys.exit(1)
+    
+    yield
+    
+    # Shutdown
+    logging.info(f"[{KERNEL_NAME}] Shutting down API kernel...")
+    if kafka_producer:
+        kafka_producer.close()
+        logging.info(f"[{KERNEL_NAME}] Kafka producer closed")
+
+# Create FastAPI app
+app = FastAPI(
+    title="Clustera API Kernel",
+    description="REST API endpoint for submitting natural language queries to Clustera",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+@app.post("/query", response_model=QueryResponse, status_code=status.HTTP_201_CREATED)
+async def submit_query(
+    request: QueryRequest,
+    authenticated: bool = Depends(verify_auth)
+) -> QueryResponse:
+    """
+    Submit a natural language query to the Clustera platform.
+    
+    The query will be published to the configured Kafka topic for processing
+    by other Clustera kernels.
+    """
+    global kafka_producer
+    
+    if not kafka_producer:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Kafka producer not available"
+        )
+    
+    # Generate unique query ID
+    query_id = str(uuid.uuid4())
+    
+    # Get topic from environment
+    topic = os.getenv("KAFKA_TOPIC_QUERIES", DEFAULT_QUERIES_TOPIC)
+    
+    # Prepare message payload
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    # Ensure metadata exists and add system fields
+    metadata = request.metadata.dict() if request.metadata else {}
+    metadata.update({
+        "source": "api_kernel",
+        "timestamp": timestamp,
+        "api_version": "0.1.0"
+    })
+    
+    message = {
+        "query_id": query_id,
+        "prompt": request.prompt,
+        "metadata": metadata
+    }
+    
+    try:
+        # Publish to Kafka
+        future = kafka_producer.send(
+            topic=topic,
+            key=query_id,
+            value=message
+        )
         
-        # Log initial state for each partition
-        for tp in assigned:
-            try:
-                # Short poll to update internal state
-                self.consumer.poll(timeout_ms=10)
-                position = self.consumer.position(tp)
-                highwater = self.consumer.highwater(tp)
-                lag = highwater - position if highwater is not None and position is not None else 'N/A'
-                logging.info(f"[{KERNEL_NAME}] Initial state for {tp}: position={position}, highwater={highwater}, lag={lag}")
-            except Exception as e:
-                logging.error(f"[{KERNEL_NAME}] Error getting initial state for {tp}: {e}")
-    
-    def on_partitions_revoked(self, revoked):
-        """Called when partitions are revoked from this consumer"""
-        partition_info = [f"{tp.topic}:{tp.partition}" for tp in revoked]
-        logging.info(f"[{KERNEL_NAME}] Partitions revoked: {', '.join(partition_info)}")
+        # Wait for confirmation (with timeout)
+        record_metadata = future.get(timeout=10)
+        
+        logging.info(
+            f"[{KERNEL_NAME}] Published query {query_id} to {topic} "
+            f"(partition {record_metadata.partition}, offset {record_metadata.offset})"
+        )
+        
+        return QueryResponse(
+            query_id=query_id,
+            topic=topic,
+            timestamp=timestamp
+        )
+        
+    except Exception as e:
+        logging.error(f"[{KERNEL_NAME}] Failed to publish query {query_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to publish query: {str(e)}"
+        )
 
-def setup_kafka_consumer():
-    """Set up and configure the Kafka consumer with SSL"""
-    # Get SSL certificate data from environment variables
-    ca_data = get_cert_data("KAFKA_CA_CERT")
-    cert_data = get_cert_data("KAFKA_CLIENT_CERT")
-    key_data = get_cert_data("KAFKA_CLIENT_KEY")
-    
-    # Write certificate data to temporary files
-    ca_file = write_cert_to_temp_file(ca_data)
-    cert_file = write_cert_to_temp_file(cert_data)
-    key_file = write_cert_to_temp_file(key_data)
-    
-    # Get topic from environment or use default
-    topic_name = os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
-    
-    consumer = KafkaConsumer(
-        topic_name,
-        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", ""),
-        client_id=os.getenv("KAFKA_CLIENT_ID", f"{KERNEL_NAME}-consumer-{os.getpid()}"),
-        group_id=os.getenv("KAFKA_CONSUMER_GROUP", f"{KERNEL_NAME}-group"),
-        security_protocol="SSL",
-        ssl_cafile=ca_file,
-        ssl_certfile=cert_file,
-        ssl_keyfile=key_file,
-        ssl_check_hostname=True,
-        session_timeout_ms=30000,      # 30 seconds
-        heartbeat_interval_ms=10000,   # 10 seconds  
-        max_poll_interval_ms=300000,   # 5 minutes
-        auto_offset_reset='earliest',  # Start from beginning if no committed offset
-        enable_auto_commit=False,      # Manual offset commits for reliability
-        max_poll_records=1             # Process one message at a time
+@app.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """Basic health check endpoint"""
+    return HealthResponse(
+        status="healthy",
+        timestamp=datetime.now(timezone.utc).isoformat()
     )
+
+@app.get("/health/kafka", response_model=KafkaHealthResponse)
+async def kafka_health_check() -> KafkaHealthResponse:
+    """Check Kafka connectivity"""
+    global kafka_producer
     
-    return consumer, (ca_file, cert_file, key_file)
+    topic = os.getenv("KAFKA_TOPIC_QUERIES", DEFAULT_QUERIES_TOPIC)
+    kafka_connected = kafka_producer is not None
+    
+    if kafka_connected:
+        try:
+            # Try to get metadata to verify connection
+            metadata = kafka_producer.partitions_for(topic)
+            kafka_connected = metadata is not None
+        except Exception as e:
+            logging.warning(f"[{KERNEL_NAME}] Kafka health check failed: {e}")
+            kafka_connected = False
+    
+    return KafkaHealthResponse(
+        status="healthy" if kafka_connected else "unhealthy",
+        kafka_connected=kafka_connected,
+        topic=topic,
+        timestamp=datetime.now(timezone.utc).isoformat()
+    )
+
+@app.get("/")
+async def root():
+    """Root endpoint with basic information"""
+    return {
+        "service": "clustera-api-kernel",
+        "version": "0.1.0",
+        "description": "REST API endpoint for submitting queries to Clustera",
+        "endpoints": {
+            "submit_query": "POST /query",
+            "health": "GET /health",
+            "kafka_health": "GET /health/kafka"
+        }
+    }
 
 def main():
-    """Main kernel execution loop"""
+    """Main entry point for running the API server"""
     # Configure logging
+    log_level = os.getenv("API_LOG_LEVEL", "info").upper()
     logging.basicConfig(
-        level=logging.INFO, 
+        level=getattr(logging, log_level),
         format=f'%(asctime)s - [{KERNEL_NAME}] - %(levelname)s - %(message)s'
     )
     
-    logging.info(f"Starting {KERNEL_NAME} kernel...")
+    # Get server configuration
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", "8000"))
     
-    # Set up Kafka consumer
-    consumer, cert_files = setup_kafka_consumer()
-    ca_file, cert_file, key_file = cert_files
+    logging.info(f"[{KERNEL_NAME}] Starting API server on {host}:{port}")
     
-    try:
-        # Subscribe with partition listener
-        partition_listener = KernelPartitionListener(consumer)
-        topic_name = os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
-        consumer.subscribe([topic_name], listener=partition_listener)
-        
-        logging.info(f"[{KERNEL_NAME}] Subscribed to topic: {topic_name}")
-        logging.info(f"[{KERNEL_NAME}] Consumer group: {consumer.config['group_id']}")
-        
-        # Main processing loop
-        while True:
-            try:
-                message_batch = consumer.poll(timeout_ms=1000)
-                
-                if not message_batch:
-                    # No messages received, continue polling
-                    continue
-                
-                # Process messages from all partitions
-                for topic_partition, messages in message_batch.items():
-                    logging.info(f"[{KERNEL_NAME}] Received {len(messages)} messages from {topic_partition}")
-                    
-                    # Process each message
-                    for i, message in enumerate(messages):
-                        logging.info(f"[{KERNEL_NAME}] Processing message {i+1}/{len(messages)} at offset {message.offset}")
-                        
-                        success = process_message(message)
-                        
-                        if not success:
-                            logging.warning(f"[{KERNEL_NAME}] Failed to process message at offset {message.offset}")
-                            # TODO: Implement error handling strategy:
-                            # - Skip and continue
-                            # - Retry with backoff
-                            # - Send to dead letter queue
-                            # - Stop processing
-                    
-                    # Manually commit offsets after processing all messages in the batch
-                    consumer.commit()
-                    logging.debug(f"[{KERNEL_NAME}] Committed offsets for {topic_partition}")
-
-            except Exception as e:
-                logging.error(f"[{KERNEL_NAME}] Error consuming messages: {e}")
-                # TODO: Implement recovery strategy
-                
-    except KeyboardInterrupt:
-        logging.info(f"[{KERNEL_NAME}] Received shutdown signal")
-    except Exception as e:
-        logging.error(f"[{KERNEL_NAME}] Fatal error: {e}")
-        raise
-    finally:
-        # Clean up temporary certificate files
-        try:
-            os.unlink(ca_file)
-            os.unlink(cert_file)
-            os.unlink(key_file)
-            logging.info(f"[{KERNEL_NAME}] Cleaned up temporary certificate files")
-        except Exception as e:
-            logging.warning(f"[{KERNEL_NAME}] Error cleaning up certificate files: {e}")
-        
-        logging.info(f"[{KERNEL_NAME}] Kernel shutdown complete")
+    # Run the server
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        access_log=True
+    )
 
 if __name__ == "__main__":
     main()

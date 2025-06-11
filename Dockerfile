@@ -14,5 +14,8 @@ RUN uv sync
 # Copy application code
 COPY . .
 
-# Command to run the application using uv
+# Expose the API port
+EXPOSE 8000
+
+# Command to run the FastAPI application using uv
 CMD ["uv", "run", "python", "main.py"]
